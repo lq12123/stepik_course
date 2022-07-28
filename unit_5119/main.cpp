@@ -1,10 +1,15 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <errno.h>
+#include <string.h>
 
 #define BUF_SIZE 1024
+#define SOCK_NAME "tmp.socket"
 
 ssize_t sock_fd_write(int sock, void* buf, ssize_t buflen, int fd)
 {
@@ -115,7 +120,7 @@ ssize_t sock_fd_read(int sock, void* buf, ssize_t bufsize, int* fd)
 void child(int sock)
 {
 	int fd;
-	char buf[16];
+	char buf[BUF_SIZE];
 	ssize_t size;
 
 	sleep(1);
@@ -125,60 +130,124 @@ void child(int sock)
 		if (size <= 0) break;
 		if (fd != -1)
 		{
-			sprintf(buf, "%d", fd);
-			write(fd, buf, strlen(buf)+1);
-			close(fd);
+			write(fd, buf, size);
 		}
 	}
 }
 
-void parent(int sock)
+void parent(int sock, int fd)
 {
 	ssize_t size;
-	int i = 1;
-	int fd = 1;
+	char Buf[BUF_SIZE];
 
-	fd = 1;
-	size = sock_fd_write(sock, &i, 1, fd);
-	//printf("wrote %lu\n", size);
+	size = read(fd, Buf, BUF_SIZE);
+	if (size > 0)
+	{
+		Buf[size] = 0;
+		sock_fd_write(sock, Buf, size+1, fd);
+	}
 }
 
-int main(int argc, char** argv)
+int main( int argc, char *argv[])
 {
 	int sv[2];
-	int pid;
-
-	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, sv) < 0)
-	{
-		perror("socketpair");
-		exit(1);
-	}
-
+	socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv);
 	if (!fork())
 	{
-		close(sv[0]);
-		child(sv[1]);
+		// Worker
+		int data_socket;
+		char Buf[BUF_SIZE];
+		struct sockaddr_un addr;
+		
+		if (-1 == (data_socket = socket(AF_UNIX, SOCK_SEQPACKET, 0)))
+		{
+			perror("socket");
+			exit(EXIT_FAILURE);
+		}
+
+		bzero(&addr, sizeof(addr));
+		addr.sun_family = AF_UNIX;
+		strncpy(addr.sun_path, SOCK_NAME, sizeof(addr.sun_path)-1);
+
+		if (-1 == connect(data_socket, (const struct sockaddr*)&addr, sizeof(addr)))
+		{
+			perror("The server is down.");
+			exit(EXIT_FAILURE);
+		}
+		
+		// send
+
+		if (-1 == write(data_socket, "123", 3))
+		{
+			perror("write");
+			exit(EXIT_FAILURE);
+		}
+
+		// Receive result
+		ssize_t size;
+		if (-1 == (size = read(data_socket, Buf, BUF_SIZE)))
+		{
+			perror("read");
+			exit(EXIT_FAILURE);
+		}
+
+		Buf[size] = 0;
+
+		printf("Result = %s\n", Buf);
+
+		close(data_socket);
 	}
 	else
 	{
-		close(sv[1]);
-		parent(sv[0]);
-	}
+		// MasterScoket
+		int MasterSocket, SlaveSocket;
+		struct sockaddr_un addr;
 
-	//switch ((pid = fork()))
-	//{
-	//case 0:
-	//	close(sv[0]);
-	//	child(sv[1]);
-	//	break;
-	//case -1:
-	//	perror("fork");	
-	//	exit(1);
-	//default:
-	//	close(sv[1]);
-	//	parent(sv[0]);
-	//	break;
-	//}
+		MasterSocket = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+
+		bzero(&addr, sizeof(addr));
+		addr.sun_family = AF_UNIX;
+		strncpy(addr.sun_path, SOCK_NAME, sizeof(addr.sun_path)-1);
+
+		if (-1 == bind(MasterSocket, (const struct sockaddr*)&addr, sizeof(addr)))
+		{
+			perror("bind");
+			exit(EXIT_FAILURE);
+		}
+
+		if (-1 == listen(MasterSocket, SOMAXCONN))
+		{
+			perror("listen");
+			exit(EXIT_FAILURE);
+		}
+
+		char Buf[BUF_SIZE];
+		for (;;)
+		{
+			if (-1 == (SlaveSocket = accept(MasterSocket, 0, 0)))
+			{
+				perror("accept");
+				exit(EXIT_FAILURE);
+			}
+
+			pid_t pid;
+			switch ((pid = fork()))
+			{
+			case 0:
+				close(sv[0]);
+				child(sv[1]);
+				break;
+			default:
+				close(sv[1]);
+				parent(sv[0], SlaveSocket);
+			}
+
+			close(SlaveSocket);
+
+		}
+		close(MasterSocket);
+	}
+	unlink(SOCK_NAME);
 
 	return 0;
 }
